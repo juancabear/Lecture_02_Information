@@ -465,10 +465,20 @@ with tab_graph:
             y_var = st.selectbox("Eje Y", numeric_cols, index=min(1, len(numeric_cols) - 1), key="scatter_y")
         with c3:
             color_var = st.selectbox("Color (opcional)", ["Ninguno"] + categorical_cols, key="scatter_color")
+        try:
+            import statsmodels.api  # noqa: F401
+            trendline = "ols"
+        except ImportError:
+            trendline = None
+            st.caption(
+                "ℹ️ Instala `statsmodels` (ver requirements.txt) para mostrar la línea de "
+                "tendencia OLS en el scatter."
+            )
+
         fig_scatter = px.scatter(
             filtered_df, x=x_var, y=y_var,
             color=None if color_var == "Ninguno" else color_var,
-            trendline="ols", hover_data=id_cols,
+            trendline=trendline, hover_data=id_cols,
             title=f"{y_var} vs {x_var}",
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
