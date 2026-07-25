@@ -1,530 +1,467 @@
 """
-EDA Interactivo - Dataset Agrícola (Fincas / Cultivos)
-Autor: Generado con Claude
+EDA desde Texto - Extracción de tablas con LLM (Groq / Llama 3.3 70B)
+Incluye dos modos:
+  1) Extracción general de tabla desde un párrafo con cifras + EDA.
+  2) Evaluación de entrevistas desde texto -> tabla de puntajes -> radar interactivo.
 Ejecutar con: streamlit run main_app.py
 """
 
 import io
+import json
+import re
+
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
+from groq import Groq, APIError, AuthenticationError, RateLimitError
 from scipy import stats
 
 # --------------------------------------------------------------------------------------
 # CONFIGURACIÓN GENERAL
 # --------------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="EDA - Dataset Agrícola",
-    page_icon="🌾",
+    page_title="EDA desde Texto (LLM)",
+    page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Columnas esperadas del dataset (se usan como ayuda para clasificar tipos,
-# pero la app también funciona si difieren ligeramente)
-COL_ID = "ID_Finca"
-COL_DEPTO = "Departamento"
-COL_CULTIVO = "Tipo_Cultivo"
-COL_AREA = "Area_Hectareas"
-COL_PROD = "Produccion_Anual_Ton"
-COL_RIEGO = "Sistema_Riego_Tecnificado"
-COL_TECNIF = "Nivel_Tecnificacion"
-COL_PRECIO = "Precio_Venta_Por_Ton_COP"
-COL_SUELO = "Tipo_Suelo"
-COL_FECHA = "Fecha_Ultima_Auditoria"
+MODEL_ID = "llama-3.3-70b-versatile"
 
-EXPECTED_NUMERIC = [COL_AREA, COL_PROD, COL_PRECIO]
-EXPECTED_CATEGORICAL = [COL_DEPTO, COL_CULTIVO, COL_RIEGO, COL_TECNIF, COL_SUELO]
-EXPECTED_DATE = [COL_FECHA]
-EXPECTED_ID = [COL_ID]
-EXPECTED_COLUMNS = EXPECTED_ID + EXPECTED_CATEGORICAL[:2] + [COL_AREA, COL_PROD, COL_RIEGO, COL_TECNIF, COL_PRECIO, COL_SUELO, COL_FECHA]
+EXTRACTION_SYSTEM_PROMPT = """Eres un asistente experto en extracción de datos estructurados a partir de texto en español.
 
+Se te dará un párrafo que contiene cifras (números, porcentajes, montos, cantidades, fechas, etc.)
+asociadas a entidades, categorías o periodos. Tu tarea es:
 
-@st.cache_data(show_spinner=False)
-def generate_sample_data(n=150, seed=42):
-    """Genera un dataset sintético de fincas para probar la app sin necesidad de un CSV."""
-    rng = np.random.default_rng(seed)
-    departamentos = ["Antioquia", "Valle del Cauca", "Cundinamarca", "Tolima", "Huila", "Santander"]
-    cultivos = ["Café", "Cacao", "Aguacate", "Plátano", "Caña de azúcar", "Maíz"]
-    suelos = ["Franco", "Arcilloso", "Arenoso", "Limoso"]
-    niveles = ["Bajo", "Medio", "Alto"]
+1. Identificar cada cifra relevante y la entidad/categoría/periodo al que pertenece.
+2. Construir una tabla en forma de arreglo JSON de objetos, donde cada objeto es una fila.
+3. Usar las MISMAS claves (nombres de columna) en todos los objetos, de forma consistente.
+4. Los valores numéricos deben quedar como números (int o float), no como texto ni con símbolos (%, $, comas de miles).
+5. Si el texto no permite construir una tabla clara, extrae lo que puedas de forma razonable.
 
-    inicio = pd.Timestamp("2023-01-01")
-    fin = pd.Timestamp("2025-12-31")
-    dias_totales = (fin - inicio).days
+Responde ÚNICAMENTE con el arreglo JSON, sin explicaciones, sin texto adicional, sin backticks
+de markdown y sin comentarios. Ejemplo de formato de salida:
 
-    df = pd.DataFrame({
-        COL_ID: [f"F-{i:04d}" for i in range(1, n + 1)],
-        COL_DEPTO: rng.choice(departamentos, n),
-        COL_CULTIVO: rng.choice(cultivos, n),
-        COL_AREA: np.round(rng.gamma(shape=3, scale=5, size=n), 2),
-        COL_RIEGO: rng.choice(["Sí", "No"], n, p=[0.4, 0.6]),
-        COL_TECNIF: rng.choice(niveles, n, p=[0.3, 0.45, 0.25]),
-        COL_SUELO: rng.choice(suelos, n),
-        COL_FECHA: [inicio + pd.Timedelta(days=int(d)) for d in rng.integers(0, dias_totales, n)],
-    })
-    tecnif_factor = df[COL_TECNIF].map({"Bajo": 0.8, "Medio": 1.0, "Alto": 1.3})
-    df[COL_PROD] = np.round(df[COL_AREA] * rng.normal(3.5, 0.6, n) * tecnif_factor, 2)
-    df[COL_PRECIO] = np.round(rng.normal(1_800_000, 250_000, n), -3)
-    return df
+[
+  {"Entidad": "Antioquia", "Variable": "Casos reportados", "Valor": 1450, "Periodo": "2024"},
+  {"Entidad": "Valle del Cauca", "Variable": "Casos reportados", "Valor": 980, "Periodo": "2024"}
+]
+"""
 
-
-# --------------------------------------------------------------------------------------
-# UTILIDADES
-# --------------------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_csv(file, sep, decimal, encoding):
-    return pd.read_csv(file, sep=sep, decimal=decimal, encoding=encoding)
-
-
-def infer_column_types(df: pd.DataFrame):
-    """Clasifica columnas en numéricas, categóricas, fecha e identificador."""
-    numeric_cols, categorical_cols, date_cols, id_cols = [], [], [], []
-
-    for col in df.columns:
-        if col in EXPECTED_ID:
-            id_cols.append(col)
-            continue
-        if col in EXPECTED_DATE:
-            date_cols.append(col)
-            continue
-        if col in EXPECTED_NUMERIC:
-            numeric_cols.append(col)
-            continue
-        if col in EXPECTED_CATEGORICAL:
-            categorical_cols.append(col)
-            continue
-
-        # Fallback: inferencia automática para columnas no reconocidas
-        if pd.api.types.is_numeric_dtype(df[col]):
-            numeric_cols.append(col)
-        elif "fecha" in col.lower() or "date" in col.lower():
-            date_cols.append(col)
-        elif df[col].nunique(dropna=True) <= max(20, int(len(df) * 0.05)):
-            categorical_cols.append(col)
-        else:
-            id_cols.append(col)
-
-    return numeric_cols, categorical_cols, date_cols, id_cols
-
-
-def coerce_types(df, numeric_cols, date_cols):
-    df = df.copy()
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    for c in date_cols:
-        df[c] = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
-    return df
-
-
-def kpi_card(label, value, help_text=None):
-    st.metric(label, value, help=help_text)
-
-
-def download_df_button(df, filename, label):
-    csv_buf = io.StringIO()
-    df.to_csv(csv_buf, index=False)
-    st.download_button(label, csv_buf.getvalue(), file_name=filename, mime="text/csv")
-
-
-# --------------------------------------------------------------------------------------
-# CARGA DE DATOS
-# --------------------------------------------------------------------------------------
-st.title("🌾 EDA Interactivo - Dataset Agrícola de Fincas")
-st.caption(
-    "Análisis exploratorio cuantitativo, cualitativo y gráfico de un dataset de "
-    "fincas, cultivos, producción y tecnificación."
+EXAMPLE_TEXT_GENERAL = (
+    "Durante el primer trimestre de 2024, el departamento de Antioquia reportó 1450 "
+    "casos de dengue, un aumento del 23% frente al mismo periodo de 2023. En Valle del "
+    "Cauca se registraron 980 casos, con una letalidad del 0.4%. Cundinamarca, por su "
+    "parte, presentó 620 casos y una cobertura de fumigación del 65%. A nivel nacional, "
+    "el presupuesto asignado para el control vectorial fue de 12500 millones de pesos, "
+    "distribuidos en 32 departamentos."
 )
 
+EXAMPLE_TEXT_ENTREVISTA = """Candidato: Mariana Restrepo Gómez | Documento: CC 1.037.612.489
+Pregunta: Cuéntanos tu proceso creativo para diseñar un personaje.
+Respuesta: Empiezo con una hoja de personalidad y un moodboard, luego exploro siluetas y por
+último detallo vestuario que refuerce la historia del personaje. Colaboro estrechamente con
+narrativa desde el inicio y tomo muy bien el feedback de dirección de arte, aunque mi manejo
+de herramientas 3D es intermedio, no avanzado.
+
+Candidato: Andrés Felipe Cárdenas Ríos | Documento: CC 71.345.612
+Pregunta: Cuéntanos tu proceso creativo para diseñar un personaje.
+Respuesta: Domino ZBrush, Maya y Substance Painter a nivel experto y calculo el presupuesto de
+polígonos desde el día uno. La narrativa no es mi fuerte, dependo del equipo de concept para
+el trasfondo. Colaboro bien con animación y programación, pero menos con narrativa.
+"""
+
+DEFAULT_AXES = "Creatividad, Dominio técnico, Narrativa, Colaboración, Adaptabilidad, Profesionalismo"
+
+
+# --------------------------------------------------------------------------------------
+# SIDEBAR: API KEY Y CONFIGURACIÓN GENERAL
+# --------------------------------------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Carga de datos")
-    data_source = st.radio(
-        "Fuente de datos",
-        ["📂 Subir archivo CSV", "🧪 Usar datos de ejemplo"],
+    st.header("⚙️ Configuración")
+    api_key = st.text_input(
+        "API Key de Groq",
+        type="password",
+        placeholder="gsk_...",
+        help="No se guarda en ningún lado; solo se usa durante esta sesión.",
+    )
+    st.caption(f"Modelo: `{MODEL_ID}`")
+
+    with st.expander("Parámetros del modelo"):
+        temperature = st.slider("Temperatura", 0.0, 1.0, 0.1, 0.05,
+                                 help="Valores bajos = extracción/evaluación más consistente.")
+        max_tokens = st.slider("Máx. tokens de respuesta", 256, 4096, 2000, 128)
+
+    st.divider()
+    modo = st.radio(
+        "Modo de análisis",
+        ["📊 Tabla general desde texto", "🕸️ Evaluación de entrevista (radar)"],
         index=0,
-        help="Elige 'Usar datos de ejemplo' si quieres explorar la app sin tener un archivo a la mano.",
     )
 
-    uploaded_file = None
-    sep, decimal, encoding = ",", ".", "utf-8"
+    st.divider()
+    st.caption("Obtén tu API Key gratuita en [console.groq.com/keys](https://console.groq.com/keys).")
 
-    if data_source == "📂 Subir archivo CSV":
-        uploaded_file = st.file_uploader(
-            "Arrastra tu archivo aquí o haz clic para seleccionarlo",
-            type=["csv"],
-            help="Solo archivos .csv. Tamaño máximo recomendado: 200 MB.",
-        )
+st.title("📝 EDA desde Texto — Extracción con LLM")
 
-        with st.expander("Opciones de lectura del CSV"):
-            sep = st.selectbox("Separador", [",", ";", "\t", "|"], index=0)
-            decimal = st.selectbox("Separador decimal", [".", ","], index=0)
-            encoding = st.selectbox("Encoding", ["utf-8", "latin1", "utf-8-sig"], index=0)
+if not api_key:
+    st.info("⬅️ Ingresa tu **API Key de Groq** en la barra lateral para comenzar.")
+    st.stop()
 
-        st.download_button(
-            "⬇️ Descargar plantilla CSV vacía",
-            data=pd.DataFrame(columns=EXPECTED_COLUMNS).to_csv(index=False).encode("utf-8"),
-            file_name="plantilla_fincas.csv",
-            mime="text/csv",
-            help="Descarga un CSV vacío con las columnas y el orden esperado.",
-        )
+client = Groq(api_key=api_key)
 
-# --- Resolución de la fuente de datos ---------------------------------------------------
-if data_source == "🧪 Usar datos de ejemplo":
-    raw_df = generate_sample_data()
-    st.success("🧪 Usando **datos de ejemplo** generados automáticamente (150 fincas simuladas).")
-elif uploaded_file is not None:
+
+# --------------------------------------------------------------------------------------
+# UTILIDADES COMPARTIDAS
+# --------------------------------------------------------------------------------------
+def clean_json_response(raw_text: str) -> str:
+    """Quita posibles fences de markdown y texto sobrante alrededor del JSON."""
+    text = raw_text.strip()
+    text = re.sub(r"^```(json)?", "", text.strip(), flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text.strip()).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+    return text
+
+
+def call_llm_for_json(system_prompt: str, user_text: str):
+    response = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    raw = response.choices[0].message.content
+    cleaned = clean_json_response(raw)
+    data = json.loads(cleaned)
+    if isinstance(data, dict):
+        data = [data]
+    return pd.DataFrame(data), raw
+
+
+def handle_llm_errors(fn, *args, **kwargs):
+    """Ejecuta fn con manejo estándar de errores de Groq / JSON. Devuelve (df, raw) o (None, None)."""
     try:
-        raw_df = load_csv(uploaded_file, sep, decimal, encoding)
-        st.toast(f"Archivo '{uploaded_file.name}' cargado correctamente ✅")
+        return fn(*args, **kwargs)
+    except AuthenticationError:
+        st.error("❌ API Key inválida. Verifica que la copiaste correctamente desde Groq Console.")
+    except RateLimitError:
+        st.error("⏳ Se alcanzó el límite de solicitudes de Groq. Espera unos segundos e intenta de nuevo.")
+    except json.JSONDecodeError:
+        st.error(
+            "⚠️ El modelo no devolvió un JSON válido. Intenta de nuevo, baja la temperatura "
+            "o reformula el texto de entrada."
+        )
+    except APIError as e:
+        st.error(f"⚠️ Error de la API de Groq: {e}")
     except Exception as e:
-        st.error(f"No se pudo leer el archivo: {e}")
-        st.stop()
-else:
-    st.info(
-        "⬅️ Sube un archivo CSV desde la barra lateral, o elige **'Usar datos de ejemplo'** "
-        "para explorar la app sin tener un archivo a la mano.\n\n"
-        "**Columnas esperadas:** `ID_Finca`, `Departamento`, `Tipo_Cultivo`, `Area_Hectareas`, "
-        "`Produccion_Anual_Ton`, `Sistema_Riego_Tecnificado`, `Nivel_Tecnificacion`, "
-        "`Precio_Venta_Por_Ton_COP`, `Tipo_Suelo`, `Fecha_Ultima_Auditoria`."
+        st.error(f"⚠️ Ocurrió un error inesperado: {e}")
+    return None, None
+
+
+# ========================================================================================
+# MODO 1: TABLA GENERAL DESDE TEXTO + EDA
+# ========================================================================================
+if modo == "📊 Tabla general desde texto":
+    st.caption(
+        "Pega un párrafo con cifras (informes, noticias, boletines) y el modelo lo convierte "
+        "en una tabla estructurada para analizarla."
     )
-    st.stop()
 
-# --- Vista previa y validación / mapeo de columnas --------------------------------------
-with st.expander("👀 Vista previa y validación de columnas", expanded=False):
-    st.write(f"**Filas leídas:** {raw_df.shape[0]}  |  **Columnas leídas:** {raw_df.shape[1]}")
-    st.dataframe(raw_df.head(10), use_container_width=True)
+    if "input_text" not in st.session_state:
+        st.session_state.input_text = ""
 
-    missing_cols = [c for c in EXPECTED_COLUMNS if c not in raw_df.columns]
-    if missing_cols:
-        st.warning(
-            f"No se encontraron **{len(missing_cols)}** columna(s) esperada(s): {missing_cols}. "
-            "Puedes mapearlas manualmente a las columnas de tu archivo, o continuar y la app "
-            "intentará inferir los tipos automáticamente."
-        )
-        rename_map = {}
-        for exp_col in missing_cols:
-            choice = st.selectbox(
-                f"¿Qué columna de tu archivo corresponde a `{exp_col}`?",
-                ["(No aplica)"] + list(raw_df.columns),
-                key=f"map_{exp_col}",
-            )
-            if choice != "(No aplica)":
-                rename_map[choice] = exp_col
-        if rename_map:
-            raw_df = raw_df.rename(columns=rename_map)
-            st.success(f"Columnas remapeadas: {rename_map}")
-    else:
-        st.success("✅ Todas las columnas esperadas están presentes.")
-
-numeric_cols, categorical_cols, date_cols, id_cols = infer_column_types(raw_df)
-df = coerce_types(raw_df, numeric_cols, date_cols)
-
-# --------------------------------------------------------------------------------------
-# FILTROS (SIDEBAR)
-# --------------------------------------------------------------------------------------
-with st.sidebar:
-    st.header("🔎 Filtros")
-    filtered_df = df.copy()
-
-    for col in categorical_cols:
-        options = sorted(df[col].dropna().unique().tolist())
-        selected = st.multiselect(f"{col}", options, default=options)
-        if selected:
-            filtered_df = filtered_df[filtered_df[col].isin(selected)]
-
-    for col in numeric_cols:
-        col_min, col_max = float(df[col].min()), float(df[col].max())
-        if np.isnan(col_min) or np.isnan(col_max) or col_min == col_max:
-            continue
-        rng = st.slider(
-            f"{col}", min_value=col_min, max_value=col_max,
-            value=(col_min, col_max),
-        )
-        filtered_df = filtered_df[filtered_df[col].between(rng[0], rng[1])]
-
-    for col in date_cols:
-        valid_dates = df[col].dropna()
-        if valid_dates.empty:
-            continue
-        min_d, max_d = valid_dates.min().date(), valid_dates.max().date()
-        date_range = st.date_input(f"{col}", value=(min_d, max_d))
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            filtered_df = filtered_df[
-                (filtered_df[col].dt.date >= date_range[0])
-                & (filtered_df[col].dt.date <= date_range[1])
-            ]
-
-    st.caption(f"Registros tras filtros: **{len(filtered_df)} / {len(df)}**")
-
-if filtered_df.empty:
-    st.warning("Los filtros seleccionados no devuelven ningún registro.")
-    st.stop()
-
-# --------------------------------------------------------------------------------------
-# KPIs GENERALES
-# --------------------------------------------------------------------------------------
-st.subheader("📌 Panorama general")
-k1, k2, k3, k4, k5 = st.columns(5)
-with k1:
-    kpi_card("N° de fincas", f"{len(filtered_df):,}")
-with k2:
-    if COL_AREA in filtered_df:
-        kpi_card("Área total (ha)", f"{filtered_df[COL_AREA].sum():,.1f}")
-with k3:
-    if COL_PROD in filtered_df:
-        kpi_card("Producción total (Ton)", f"{filtered_df[COL_PROD].sum():,.1f}")
-with k4:
-    if COL_PRECIO in filtered_df:
-        kpi_card("Precio prom. (COP/Ton)", f"{filtered_df[COL_PRECIO].mean():,.0f}")
-with k5:
-    if COL_RIEGO in filtered_df:
-        pct_riego = (
-            filtered_df[COL_RIEGO].astype(str).str.lower().isin(["si", "sí", "true", "1", "yes"])
-        ).mean() * 100
-        kpi_card("% Riego tecnificado", f"{pct_riego:,.1f}%")
-
-st.divider()
-
-# --------------------------------------------------------------------------------------
-# TABS PRINCIPALES
-# --------------------------------------------------------------------------------------
-tab_overview, tab_quant, tab_qual, tab_graph, tab_corr, tab_data = st.tabs(
-    [
-        "🧭 Resumen y calidad de datos",
-        "🔢 Análisis cuantitativo",
-        "🔤 Análisis cualitativo",
-        "📈 Análisis gráfico",
-        "🔗 Correlaciones y cruces",
-        "🗂️ Datos filtrados",
-    ]
-)
-
-# ---------------------------- TAB 1: RESUMEN / CALIDAD ---------------------------------
-with tab_overview:
-    st.markdown("### Estructura del dataset")
-    c1, c2 = st.columns([1, 1])
+    c1, c2 = st.columns([4, 1])
     with c1:
-        st.write(f"**Filas:** {df.shape[0]}  |  **Columnas:** {df.shape[1]}")
-        st.write("**Tipos de columna detectados:**")
-        st.write(f"- Numéricas: {numeric_cols}")
-        st.write(f"- Categóricas: {categorical_cols}")
-        st.write(f"- Fecha: {date_cols}")
-        st.write(f"- Identificador: {id_cols}")
+        st.text_area(
+            "Pega aquí tu párrafo con cifras",
+            key="input_text",
+            height=180,
+            placeholder="Ejemplo: 'Durante 2024, la empresa X reportó ventas de 3200 millones...'",
+        )
     with c2:
-        st.markdown("**Valores nulos por columna**")
-        nulls = df.isna().sum()
-        nulls_pct = (df.isna().mean() * 100).round(2)
-        nulls_df = pd.DataFrame({"Nulos": nulls, "% Nulos": nulls_pct})
-        st.dataframe(nulls_df.style.background_gradient(cmap="Reds", subset=["% Nulos"]))
+        st.write("")
+        st.write("")
+        if st.button("📋 Usar texto de ejemplo", use_container_width=True, key="ejemplo_general"):
+            st.session_state.input_text = EXAMPLE_TEXT_GENERAL
+            st.rerun()
 
-    st.markdown("### Duplicados")
-    dup_count = df.duplicated().sum()
-    dup_id_count = df.duplicated(subset=id_cols).sum() if id_cols else 0
-    d1, d2 = st.columns(2)
-    d1.metric("Filas totalmente duplicadas", int(dup_count))
-    d2.metric(f"Duplicados por {id_cols[0] if id_cols else 'ID'}", int(dup_id_count))
+    extract_clicked = st.button("🔍 Extraer tabla con el LLM", type="primary", use_container_width=True)
 
-    st.markdown("### Vista previa")
-    st.dataframe(df.head(20), use_container_width=True)
-
-# ---------------------------- TAB 2: CUANTITATIVO ---------------------------------------
-with tab_quant:
-    st.markdown("### Estadística descriptiva")
-    if numeric_cols:
-        desc = filtered_df[numeric_cols].describe().T
-        desc["mediana"] = filtered_df[numeric_cols].median()
-        desc["varianza"] = filtered_df[numeric_cols].var()
-        desc["asimetría"] = filtered_df[numeric_cols].skew()
-        desc["curtosis"] = filtered_df[numeric_cols].kurt()
-        desc["CV (%)"] = (desc["std"] / desc["mean"] * 100).round(2)
-        st.dataframe(desc.style.format(precision=2), use_container_width=True)
-        download_df_button(desc.reset_index(), "estadistica_descriptiva.csv", "⬇️ Descargar estadística descriptiva")
-    else:
-        st.info("No se detectaron columnas numéricas.")
-
-    st.markdown("### Detección de valores atípicos (IQR)")
-    if numeric_cols:
-        col_sel = st.selectbox("Selecciona variable numérica", numeric_cols, key="outlier_col")
-        s = filtered_df[col_sel].dropna()
-        q1, q3 = s.quantile(0.25), s.quantile(0.75)
-        iqr = q3 - q1
-        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        outliers = s[(s < lower) | (s > upper)]
-        o1, o2, o3 = st.columns(3)
-        o1.metric("Límite inferior", f"{lower:,.2f}")
-        o2.metric("Límite superior", f"{upper:,.2f}")
-        o3.metric("N° de atípicos", f"{len(outliers)} ({len(outliers)/len(s)*100:.1f}%)")
-        fig_box = px.box(filtered_df, y=col_sel, points="outliers", title=f"Boxplot de {col_sel}")
-        st.plotly_chart(fig_box, use_container_width=True)
-
-    st.markdown("### Prueba de normalidad (Shapiro-Wilk)")
-    if numeric_cols:
-        col_norm = st.selectbox("Variable a evaluar", numeric_cols, key="norm_col")
-        sample = filtered_df[col_norm].dropna()
-        if 3 <= len(sample) <= 5000:
-            stat, p_value = stats.shapiro(sample)
-            n1, n2 = st.columns(2)
-            n1.metric("Estadístico W", f"{stat:.4f}")
-            n2.metric("p-valor", f"{p_value:.4f}")
-            if p_value < 0.05:
-                st.warning("Se rechaza H0: la variable **no** sigue una distribución normal (p < 0.05).")
-            else:
-                st.success("No se rechaza H0: la variable es compatible con una distribución normal (p ≥ 0.05).")
+    if extract_clicked:
+        if not st.session_state.input_text.strip():
+            st.warning("Pega un párrafo con cifras antes de extraer la tabla.")
         else:
-            st.info("El tamaño de muestra debe estar entre 3 y 5000 para esta prueba.")
+            with st.spinner("Extrayendo tabla con el modelo..."):
+                table_df, raw_response = handle_llm_errors(
+                    call_llm_for_json, EXTRACTION_SYSTEM_PROMPT, st.session_state.input_text
+                )
+                if table_df is not None:
+                    st.session_state.extracted_df = table_df
+                    st.session_state.raw_response = raw_response
 
-# ---------------------------- TAB 3: CUALITATIVO -----------------------------------------
-with tab_qual:
-    st.markdown("### Frecuencias de variables categóricas")
-    if categorical_cols:
-        cat_sel = st.selectbox("Selecciona variable categórica", categorical_cols, key="cat_sel")
-        freq = filtered_df[cat_sel].value_counts(dropna=False).rename("Frecuencia").to_frame()
-        freq["% del total"] = (freq["Frecuencia"] / freq["Frecuencia"].sum() * 100).round(2)
-        c1, c2 = st.columns([1, 1.4])
-        with c1:
-            st.dataframe(freq, use_container_width=True)
-            download_df_button(freq.reset_index(), f"frecuencias_{cat_sel}.csv", "⬇️ Descargar tabla de frecuencias")
-        with c2:
-            chart_type = st.radio("Tipo de gráfico", ["Barras", "Pastel"], horizontal=True, key="qual_chart")
-            if chart_type == "Barras":
+    if "extracted_df" not in st.session_state:
+        st.stop()
+
+    st.divider()
+    st.subheader("📊 Tabla extraída (editable)")
+    st.caption("Puedes corregir manualmente cualquier celda antes de continuar con el EDA.")
+
+    edited_df = st.data_editor(
+        st.session_state.extracted_df, num_rows="dynamic", use_container_width=True, key="editor_general"
+    )
+
+    with st.expander("Ver JSON crudo devuelto por el modelo"):
+        st.code(st.session_state.get("raw_response", ""), language="json")
+
+    csv_buf = io.StringIO()
+    edited_df.to_csv(csv_buf, index=False)
+    st.download_button("⬇️ Descargar tabla como CSV", csv_buf.getvalue(),
+                        file_name="tabla_extraida.csv", mime="text/csv")
+
+    if edited_df.empty:
+        st.warning("La tabla está vacía. Ajusta el texto de entrada o edita la tabla manualmente.")
+        st.stop()
+
+    df = edited_df.copy()
+    numeric_cols, categorical_cols = [], []
+    for col in df.columns:
+        coerced = pd.to_numeric(df[col], errors="coerce")
+        if coerced.notna().sum() >= max(1, int(len(df) * 0.6)):
+            df[col] = coerced
+            numeric_cols.append(col)
+        else:
+            categorical_cols.append(col)
+
+    st.divider()
+    st.subheader("🔎 Análisis exploratorio de la tabla extraída")
+
+    tab_quant, tab_qual, tab_graph = st.tabs(["🔢 Cuantitativo", "🔤 Cualitativo", "📈 Gráfico"])
+
+    with tab_quant:
+        if numeric_cols:
+            desc = df[numeric_cols].describe().T
+            desc["mediana"] = df[numeric_cols].median()
+            st.dataframe(desc.style.format(precision=2), use_container_width=True)
+
+            if len(df) >= 3:
+                col_sel = st.selectbox("Variable para prueba de normalidad (Shapiro-Wilk)", numeric_cols)
+                sample = df[col_sel].dropna()
+                if len(sample) >= 3:
+                    stat, p_value = stats.shapiro(sample)
+                    n1, n2 = st.columns(2)
+                    n1.metric("Estadístico W", f"{stat:.4f}")
+                    n2.metric("p-valor", f"{p_value:.4f}")
+        else:
+            st.info("No se detectaron columnas numéricas en la tabla extraída.")
+
+    with tab_qual:
+        if categorical_cols:
+            cat_sel = st.selectbox("Variable categórica", categorical_cols)
+            freq = df[cat_sel].value_counts(dropna=False).rename("Frecuencia").to_frame()
+            c1, c2 = st.columns([1, 1.4])
+            with c1:
+                st.dataframe(freq, use_container_width=True)
+            with c2:
                 fig = px.bar(freq.reset_index(), x=cat_sel, y="Frecuencia", text="Frecuencia",
                              title=f"Distribución de {cat_sel}")
-            else:
-                fig = px.pie(freq.reset_index(), names=cat_sel, values="Frecuencia",
-                             title=f"Distribución de {cat_sel}")
-            st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No se detectaron columnas categóricas en la tabla extraída.")
 
-        st.markdown("### Tabla de contingencia (2 variables categóricas)")
-        if len(categorical_cols) >= 2:
+    with tab_graph:
+        if numeric_cols and categorical_cols:
+            c1, c2 = st.columns(2)
+            with c1:
+                cat_x = st.selectbox("Variable categórica (eje X)", categorical_cols, key="g_cat")
+            with c2:
+                num_y = st.selectbox("Variable numérica (eje Y)", numeric_cols, key="g_num")
+            fig_bar = px.bar(df, x=cat_x, y=num_y, color=cat_x, title=f"{num_y} por {cat_x}")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        if len(numeric_cols) >= 2:
             c3, c4 = st.columns(2)
             with c3:
-                var1 = st.selectbox("Variable 1", categorical_cols, index=0, key="cross1")
+                x_var = st.selectbox("Eje X", numeric_cols, index=0, key="s_x")
             with c4:
-                remaining = [c for c in categorical_cols if c != var1]
-                var2 = st.selectbox("Variable 2", remaining, index=0, key="cross2")
-            crosstab = pd.crosstab(filtered_df[var1], filtered_df[var2])
-            st.dataframe(crosstab, use_container_width=True)
-            fig_hm = px.imshow(crosstab, text_auto=True, aspect="auto",
-                                title=f"Mapa de calor: {var1} vs {var2}", color_continuous_scale="Blues")
-            st.plotly_chart(fig_hm, use_container_width=True)
+                y_var = st.selectbox("Eje Y", numeric_cols, index=min(1, len(numeric_cols) - 1), key="s_y")
+            fig_scatter = px.scatter(df, x=x_var, y=y_var, title=f"{y_var} vs {x_var}")
+            st.plotly_chart(fig_scatter, use_container_width=True)
 
-            # Chi-cuadrado de independencia
-            try:
-                chi2, p, dof, _ = stats.chi2_contingency(crosstab)
-                cc1, cc2, cc3 = st.columns(3)
-                cc1.metric("Chi-cuadrado", f"{chi2:.2f}")
-                cc2.metric("p-valor", f"{p:.4f}")
-                cc3.metric("Grados de libertad", dof)
-                if p < 0.05:
-                    st.warning("Existe asociación estadísticamente significativa entre las variables (p < 0.05).")
-                else:
-                    st.success("No hay evidencia de asociación significativa entre las variables (p ≥ 0.05).")
-            except Exception:
-                st.info("No fue posible calcular la prueba Chi-cuadrado con los datos actuales.")
+            st.markdown("**Matriz de correlación**")
+            corr = df[numeric_cols].corr()
+            fig_corr = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+            st.plotly_chart(fig_corr, use_container_width=True)
+
+        if not numeric_cols and not categorical_cols:
+            st.info("No hay suficientes columnas para generar gráficos.")
+
+
+# ========================================================================================
+# MODO 2: EVALUACIÓN DE ENTREVISTA DESDE TEXTO -> TABLA DE PUNTAJES -> RADAR INTERACTIVO
+# ========================================================================================
+else:
+    st.caption(
+        "Pega el texto de una o varias entrevistas (nombre, documento y respuestas de cada "
+        "candidato). El LLM evalúa cualitativamente cada respuesta y genera puntajes por "
+        "competencia; luego puedes comparar a los candidatos con un radar interactivo."
+    )
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("🕸️ Ejes de evaluación")
+        axes_input = st.text_area(
+            "Competencias a evaluar (separadas por coma)",
+            value=DEFAULT_AXES,
+            height=80,
+            help="El LLM asignará un puntaje de 1 a `escala_max` en cada uno de estos ejes.",
+        )
+        scale_max = st.number_input("Escala máxima de puntaje", min_value=5, max_value=100, value=10, step=5)
+
+    axes_list = [a.strip() for a in axes_input.split(",") if a.strip()]
+
+    if "interview_text" not in st.session_state:
+        st.session_state.interview_text = ""
+
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        st.text_area(
+            "Pega aquí el texto con las entrevistas (candidato, documento, preguntas y respuestas)",
+            key="interview_text",
+            height=220,
+            placeholder="Candidato: Nombre | Documento: CC 0000000\nPregunta: ...\nRespuesta: ...",
+        )
+    with c2:
+        st.write("")
+        st.write("")
+        if st.button("📋 Usar texto de ejemplo", use_container_width=True, key="ejemplo_entrevista"):
+            st.session_state.interview_text = EXAMPLE_TEXT_ENTREVISTA
+            st.rerun()
+
+    evaluate_clicked = st.button("🕸️ Evaluar entrevista(s) y generar puntajes", type="primary", use_container_width=True)
+
+    def build_interview_prompt(axes, scale):
+        axes_str = ", ".join(f'"{a}"' for a in axes)
+        example_obj = {"Candidato": "Nombre Ejemplo", "Documento": "CC 0000000"}
+        for a in axes:
+            example_obj[a] = round(scale * 0.7)
+        return f"""Eres un evaluador experto de entrevistas de selección de personal, especializado en
+roles creativos y técnicos de la industria de videojuegos.
+
+Se te dará el texto de una o varias entrevistas. Cada entrevista puede incluir el nombre del
+candidato, su número de documento, y una o varias preguntas con sus respuestas.
+
+Tu tarea:
+1. Identifica cada candidato distinto mencionado en el texto (por nombre y/o documento).
+2. Evalúa cualitativamente sus respuestas y asigna un puntaje entero de 1 a {scale} en cada uno
+   de estos ejes de competencia: {axes_str}.
+3. Si el texto no da información suficiente para evaluar un eje de un candidato, asigna tu mejor
+   estimación razonable en vez de dejarlo vacío.
+4. Devuelve un arreglo JSON con un objeto por candidato, usando EXACTAMENTE estas claves:
+   "Candidato", "Documento" y una clave por cada eje de competencia (con el mismo nombre y
+   mayúsculas/tildes que se te dieron).
+
+Responde ÚNICAMENTE con el arreglo JSON, sin explicaciones ni texto adicional ni backticks de
+markdown. Ejemplo de formato de salida (con un solo candidato):
+
+[{json.dumps(example_obj, ensure_ascii=False)}]
+"""
+
+    if evaluate_clicked:
+        if not st.session_state.interview_text.strip():
+            st.warning("Pega el texto de al menos una entrevista antes de evaluar.")
+        elif not axes_list:
+            st.warning("Define al menos un eje de evaluación en la barra lateral.")
+        else:
+            prompt = build_interview_prompt(axes_list, scale_max)
+            with st.spinner("Evaluando entrevista(s) con el modelo..."):
+                scores_df, raw_response = handle_llm_errors(
+                    call_llm_for_json, prompt, st.session_state.interview_text
+                )
+                if scores_df is not None:
+                    st.session_state.scores_df = scores_df
+                    st.session_state.raw_response_entrevista = raw_response
+                    st.session_state.axes_list = axes_list
+                    st.session_state.scale_max = scale_max
+
+    if "scores_df" not in st.session_state:
+        st.stop()
+
+    st.divider()
+    st.subheader("📋 Puntajes extraídos (editable)")
+    st.caption("Corrige manualmente cualquier puntaje antes de generar el radar, si lo consideras necesario.")
+
+    edited_scores = st.data_editor(
+        st.session_state.scores_df, num_rows="dynamic", use_container_width=True, key="editor_scores"
+    )
+
+    with st.expander("Ver JSON crudo devuelto por el modelo"):
+        st.code(st.session_state.get("raw_response_entrevista", ""), language="json")
+
+    csv_buf2 = io.StringIO()
+    edited_scores.to_csv(csv_buf2, index=False)
+    st.download_button("⬇️ Descargar puntajes como CSV", csv_buf2.getvalue(),
+                        file_name="puntajes_entrevista.csv", mime="text/csv")
+
+    if edited_scores.empty:
+        st.warning("La tabla de puntajes está vacía.")
+        st.stop()
+
+    # Detectar columna de identificación (Candidato) y columnas de ejes numéricos
+    id_col = "Candidato" if "Candidato" in edited_scores.columns else edited_scores.columns[0]
+    axis_cols = [c for c in st.session_state.axes_list if c in edited_scores.columns]
+    if not axis_cols:
+        axis_cols = [c for c in edited_scores.columns
+                     if pd.to_numeric(edited_scores[c], errors="coerce").notna().all()]
+
+    for c in axis_cols:
+        edited_scores[c] = pd.to_numeric(edited_scores[c], errors="coerce")
+
+    # --------------------------------------------------------------------------------
+    # RADAR INTERACTIVO
+    # --------------------------------------------------------------------------------
+    st.divider()
+    st.subheader("🕸️ Radar comparativo de candidatos")
+
+    all_candidates = edited_scores[id_col].dropna().astype(str).tolist()
+    selected = st.multiselect(
+        "Candidatos a comparar", all_candidates, default=all_candidates, key="radar_select"
+    )
+
+    if selected and axis_cols:
+        fig_radar = go.Figure()
+        for _, row in edited_scores[edited_scores[id_col].astype(str).isin(selected)].iterrows():
+            values = [row[c] for c in axis_cols]
+            values_closed = values + values[:1]
+            theta_closed = axis_cols + axis_cols[:1]
+            fig_radar.add_trace(go.Scatterpolar(
+                r=values_closed, theta=theta_closed, fill="toself",
+                name=str(row[id_col]), opacity=0.6,
+            ))
+        fig_radar.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, st.session_state.scale_max])),
+            showlegend=True, height=600,
+            title="Comparación de competencias por candidato",
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
     else:
-        st.info("No se detectaron columnas categóricas.")
+        st.info("Selecciona al menos un candidato y define ejes numéricos válidos para ver el radar.")
 
-# ---------------------------- TAB 4: GRÁFICO --------------------------------------------
-with tab_graph:
-    st.markdown("### Distribución de una variable numérica")
-    if numeric_cols:
-        num_sel = st.selectbox("Variable numérica", numeric_cols, key="hist_col")
-        color_by = st.selectbox("Colorear por (opcional)", ["Ninguno"] + categorical_cols, key="hist_color")
-        fig_hist = px.histogram(
-            filtered_df, x=num_sel, nbins=30, marginal="box",
-            color=None if color_by == "Ninguno" else color_by,
-            title=f"Distribución de {num_sel}",
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
+    st.markdown("**Tabla comparativa de puntajes**")
+    st.dataframe(edited_scores, use_container_width=True)
 
-    st.markdown("### Comparación numérica por categoría")
-    if numeric_cols and categorical_cols:
-        c1, c2 = st.columns(2)
-        with c1:
-            num_y = st.selectbox("Variable numérica (Y)", numeric_cols, key="box_num")
-        with c2:
-            cat_x = st.selectbox("Variable categórica (X)", categorical_cols, key="box_cat")
-        fig_box2 = px.box(filtered_df, x=cat_x, y=num_y, color=cat_x,
-                           title=f"{num_y} por {cat_x}")
-        st.plotly_chart(fig_box2, use_container_width=True)
-
-        fig_bar_agg = px.bar(
-            filtered_df.groupby(cat_x, as_index=False)[num_y].mean(),
-            x=cat_x, y=num_y, title=f"Promedio de {num_y} por {cat_x}",
-        )
-        st.plotly_chart(fig_bar_agg, use_container_width=True)
-
-    st.markdown("### Relación entre dos variables numéricas")
-    if len(numeric_cols) >= 2:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            x_var = st.selectbox("Eje X", numeric_cols, index=0, key="scatter_x")
-        with c2:
-            y_var = st.selectbox("Eje Y", numeric_cols, index=min(1, len(numeric_cols) - 1), key="scatter_y")
-        with c3:
-            color_var = st.selectbox("Color (opcional)", ["Ninguno"] + categorical_cols, key="scatter_color")
-        try:
-            import statsmodels.api  # noqa: F401
-            trendline = "ols"
-        except ImportError:
-            trendline = None
-            st.caption(
-                "ℹ️ Instala `statsmodels` (ver requirements.txt) para mostrar la línea de "
-                "tendencia OLS en el scatter."
-            )
-
-        fig_scatter = px.scatter(
-            filtered_df, x=x_var, y=y_var,
-            color=None if color_var == "Ninguno" else color_var,
-            trendline=trendline, hover_data=id_cols,
-            title=f"{y_var} vs {x_var}",
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    if date_cols and numeric_cols:
-        st.markdown("### Serie temporal")
-        c1, c2 = st.columns(2)
-        with c1:
-            date_sel = st.selectbox("Variable de fecha", date_cols, key="ts_date")
-        with c2:
-            num_ts = st.selectbox("Variable numérica", numeric_cols, key="ts_num")
-        ts_df = filtered_df.dropna(subset=[date_sel]).sort_values(date_sel)
-        if not ts_df.empty:
-            fig_ts = px.line(
-                ts_df.groupby(pd.Grouper(key=date_sel, freq="M"))[num_ts].mean().reset_index(),
-                x=date_sel, y=num_ts, markers=True,
-                title=f"Evolución mensual promedio de {num_ts}",
-            )
-            st.plotly_chart(fig_ts, use_container_width=True)
-
-# ---------------------------- TAB 5: CORRELACIONES ---------------------------------------
-with tab_corr:
-    st.markdown("### Matriz de correlación (numéricas)")
-    if len(numeric_cols) >= 2:
-        method = st.radio("Método", ["pearson", "spearman", "kendall"], horizontal=True)
-        corr = filtered_df[numeric_cols].corr(method=method)
-        fig_corr = px.imshow(
-            corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
-            title=f"Matriz de correlación ({method})",
-        )
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-        st.markdown("### Matriz de dispersión (scatter matrix)")
-        dims = st.multiselect("Variables a incluir", numeric_cols, default=numeric_cols[:4])
-        color_scatter = st.selectbox("Color por", ["Ninguno"] + categorical_cols, key="splom_color")
-        if len(dims) >= 2:
-            fig_splom = px.scatter_matrix(
-                filtered_df, dimensions=dims,
-                color=None if color_scatter == "Ninguno" else color_scatter,
-            )
-            st.plotly_chart(fig_splom, use_container_width=True)
-    else:
-        st.info("Se necesitan al menos 2 columnas numéricas para calcular correlaciones.")
-
-# ---------------------------- TAB 6: DATOS ------------------------------------------------
-with tab_data:
-    st.markdown("### Datos filtrados")
-    st.dataframe(filtered_df, use_container_width=True)
-    download_df_button(filtered_df, "datos_filtrados.csv", "⬇️ Descargar datos filtrados (CSV)")
+    if len(all_candidates) >= 2 and axis_cols:
+        st.markdown("**Promedio por eje (todos los candidatos evaluados)**")
+        avg_scores = edited_scores[axis_cols].mean().reset_index()
+        avg_scores.columns = ["Eje", "Promedio"]
+        fig_avg = px.bar(avg_scores, x="Eje", y="Promedio", text="Promedio",
+                          title="Promedio del grupo por eje de competencia")
+        fig_avg.update_traces(texttemplate="%{text:.1f}")
+        st.plotly_chart(fig_avg, use_container_width=True)
