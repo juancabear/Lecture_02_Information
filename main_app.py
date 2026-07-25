@@ -15,6 +15,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from docx import Document as DocxDocument
 from groq import Groq, APIError, AuthenticationError, RateLimitError
 from scipy import stats
 
@@ -330,20 +331,55 @@ else:
     if "interview_text" not in st.session_state:
         st.session_state.interview_text = ""
 
-    c1, c2 = st.columns([4, 1])
-    with c1:
+    st.markdown("**📄 Carga el documento con todas las entrevistas**")
+    uploaded_interview_file = st.file_uploader(
+        "Sube el archivo con las entrevistas (.docx o .txt)",
+        type=["docx", "txt"],
+        key="interview_file",
+        help="Por ejemplo, el Word consolidado con nombre, documento y respuestas de cada candidato.",
+    )
+
+    def extract_text_from_docx(file_obj) -> str:
+        doc = DocxDocument(file_obj)
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells_text = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells_text:
+                    parts.append(" | ".join(cells_text))
+        return "\n".join(parts)
+
+    if uploaded_interview_file is not None and st.session_state.get("last_uploaded_name") != uploaded_interview_file.name:
+        try:
+            if uploaded_interview_file.name.lower().endswith(".docx"):
+                extracted_text = extract_text_from_docx(uploaded_interview_file)
+            else:
+                extracted_text = uploaded_interview_file.read().decode("utf-8", errors="ignore")
+            st.session_state.interview_text = extracted_text
+            st.session_state.last_uploaded_name = uploaded_interview_file.name
+            st.rerun()
+        except Exception as e:
+            st.error(f"⚠️ No se pudo leer el archivo: {e}")
+
+    with st.expander("✏️ Ver / editar el texto cargado manualmente", expanded=not st.session_state.interview_text):
         st.text_area(
-            "Pega aquí el texto con las entrevistas (candidato, documento, preguntas y respuestas)",
+            "Texto de las entrevistas (editable)",
             key="interview_text",
-            height=220,
+            height=260,
             placeholder="Candidato: Nombre | Documento: CC 0000000\nPregunta: ...\nRespuesta: ...",
         )
-    with c2:
-        st.write("")
-        st.write("")
-        if st.button("📋 Usar texto de ejemplo", use_container_width=True, key="ejemplo_entrevista"):
+        if st.button("📋 Usar texto de ejemplo", key="ejemplo_entrevista"):
             st.session_state.interview_text = EXAMPLE_TEXT_ENTREVISTA
             st.rerun()
+
+    n_chars = len(st.session_state.interview_text)
+    if n_chars > 0:
+        st.caption(f"Texto cargado: {n_chars:,} caracteres (~{n_chars // 4:,} tokens aprox.).")
+    if n_chars > 60000:
+        st.warning(
+            "El documento es bastante largo; si el modelo trunca la respuesta o falla, "
+            "sube el archivo por partes o aumenta 'Máx. tokens de respuesta' en la barra lateral."
+        )
 
     evaluate_clicked = st.button("🕸️ Evaluar entrevista(s) y generar puntajes", type="primary", use_container_width=True)
 
